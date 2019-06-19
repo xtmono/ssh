@@ -44,6 +44,9 @@ type Session interface {
 	// which considers quoting not just whitespace.
 	Command() []string
 
+	// Subsystem returns the subsystem requested by the user.
+	Subsystem() string
+
 	// PublicKey returns the PublicKey used to authenticate. If a public key was not
 	// used it will return nil.
 	PublicKey() PublicKey
@@ -84,12 +87,13 @@ func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.Ne
 		return
 	}
 	sess := &session{
-		Channel:   ch,
-		conn:      conn,
-		handler:   srv.Handler,
-		ptyCb:     srv.PtyCallback,
-		sessReqCb: srv.SessionRequestCallback,
-		ctx:       ctx,
+		Channel:           ch,
+		conn:              conn,
+		handler:           srv.Handler,
+		ptyCb:             srv.PtyCallback,
+		sessReqCb:         srv.SessionRequestCallback,
+		subsystemHandlers: srv.SubsystemHandlers,
+		ctx:               ctx,
 	}
 	sess.handleRequests(reqs)
 }
@@ -97,19 +101,21 @@ func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.Ne
 type session struct {
 	sync.Mutex
 	gossh.Channel
-	conn      *gossh.ServerConn
-	handler   Handler
-	handled   bool
-	exited    bool
-	pty       *Pty
-	winch     chan Window
-	env       []string
-	ptyCb     PtyCallback
-	sessReqCb SessionRequestCallback
-	cmd       []string
-	ctx       Context
-	sigCh     chan<- Signal
-	sigBuf    []Signal
+	conn              *gossh.ServerConn
+	handler           Handler
+	subsystemHandlers map[string]SubsystemHandler
+	handled           bool
+	exited            bool
+	pty               *Pty
+	winch             chan Window
+	env               []string
+	ptyCb             PtyCallback
+	sessReqCb         SessionRequestCallback
+	cmd               []string
+	subsystem         string
+	ctx               Context
+	sigCh             chan<- Signal
+	sigBuf            []Signal
 }
 
 func (sess *session) Write(p []byte) (n int, err error) {
@@ -183,6 +189,10 @@ func (sess *session) Command() []string {
 	return append([]string(nil), sess.cmd...)
 }
 
+func (sess *session) Subsystem() string {
+	return sess.subsystem
+}
+
 func (sess *session) Pty() (Pty, <-chan Window, bool) {
 	if sess.pty != nil {
 		return *sess.pty, sess.winch, true
@@ -229,6 +239,40 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 
 			go func() {
 				sess.handler(sess)
+				sess.Exit(0)
+			}()
+		case "subsystem":
+			if sess.handled {
+				req.Reply(false, nil)
+				continue
+			}
+
+			var payload = struct{ Value string }{}
+			gossh.Unmarshal(req.Payload, &payload)
+			sess.subsystem = payload.Value
+
+			// If there's a session policy callback, we need to confirm before
+			// accepting the session.
+			if sess.sessReqCb != nil && !sess.sessReqCb(sess, req.Type) {
+				sess.cmd = nil
+				req.Reply(false, nil)
+				continue
+			}
+
+			handler := sess.subsystemHandlers[payload.Value]
+			if handler == nil {
+				handler = sess.subsystemHandlers["default"]
+			}
+			if handler == nil {
+				req.Reply(false, nil)
+				continue
+			}
+
+			sess.handled = true
+			req.Reply(true, nil)
+
+			go func() {
+				handler(sess)
 				sess.Exit(0)
 			}()
 		case "env":
