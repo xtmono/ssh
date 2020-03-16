@@ -67,6 +67,12 @@ type Session interface {
 	// of whether or not a PTY was accepted for this session.
 	Pty() (Pty, <-chan Window, bool)
 
+	// Get window size
+	GetWindowSize() int
+
+	// Change window size
+	WindowSizeChanged(f func())
+
 	// Signals registers a channel to receive signals sent from the client. The
 	// channel must handle signal sends or it will block the SSH request loop.
 	// Registering nil will unregister the channel from signal sends. During the
@@ -196,6 +202,25 @@ func (sess *session) Pty() (Pty, <-chan Window, bool) {
 		return *sess.pty, sess.winch, true
 	}
 	return Pty{}, sess.winch, false
+}
+
+func (sess *session) GetWindowSize() int {
+	if sess.pty != nil {
+		return sess.pty.Window.Width
+	}
+	return -1
+}
+
+func (sess *session) WindowSizeChanged(f func()) {
+	go func() {
+		for {
+			_, ok := <-sess.winch
+			if !ok {
+				break
+			}
+			f()
+		}
+	}()
 }
 
 func (sess *session) Signals(c chan<- Signal) {
